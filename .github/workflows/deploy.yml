@@ -1,0 +1,58 @@
+name: WarpDrive Deploy (Vercel + Cloudflare, Canary)
+on: { push: { branches: [ main ] } }
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+      CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
+      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+      VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+      VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+      SUBDOMAIN: ${{ vars.SUBDOMAIN }}       # market
+      ROOT_DOMAIN: ${{ vars.ROOT_DOMAIN }}   # e.g. starblast.ai
+      HEALTH_PATH: /api/health
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - run: npm ci
+      - name: Build
+        run: npm run build
+      - name: Deploy to Vercel (prod)
+        run: |
+          npm i -g vercel jq
+          DEPLOY_URL=$(vercel --token "$VERCEL_TOKEN" --confirm --prod --scope "$VERCEL_ORG_ID" 2>/dev/null | tail -n1)
+          echo "DEPLOY_URL=$DEPLOY_URL" >> $GITHUB_ENV
+      - name: Canary health check
+        run: |
+          set -e
+          url="${ '{' } env.DEPLOY_URL { '}' }${ '{' } env.HEALTH_PATH { '}' }"
+          echo "Probing: $url"
+          for i in $(seq 1 20); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "$url")
+            if [ "$code" = "200" ]; then
+              echo "Health OK"
+              exit 0
+            fi
+            echo "Health not ready (code=$code). Retry $i/20..."; sleep 5
+          done
+          echo "Health check failed"; exit 1
+      - name: Set DNS to Vercel CNAME (Cloudflare)
+        if: ${{ success() }}
+        run: |
+          set -e
+          HOST="${ '{' } env.SUBDOMAIN { '}' }.${ '{' } env.ROOT_DOMAIN { '}' }"
+          TARGET=$(echo "${ '{' } env.DEPLOY_URL { '}' }" | sed 's#^https\?://##')
+          echo "Upserting CNAME: $HOST -> $TARGET"
+          rec=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records?type=CNAME&name=$HOST"             -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json")
+          RID=$(echo "$rec" | jq -r '.result[0].id // empty')
+          DATA=$(jq -n --arg name "$HOST" --arg content "$TARGET" '{' + 'type:"CNAME", name:$name, content:$content, ttl:120, proxied:true' + '}')
+          if [ -z "$RID" ]; then
+            curl -s -X POST "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records"               -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json"               --data "$DATA" >/dev/null
+          else
+            curl -s -X PUT "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records/$RID"               -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json"               --data "$DATA" >/dev/null
+          fi
+          echo "DNS set ✅"
